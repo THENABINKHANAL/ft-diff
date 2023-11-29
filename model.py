@@ -20,6 +20,9 @@ from utils import WebdatasetFilter, transforms, effnet_preprocess, identity
 import transformers
 from transformers.utils import is_torch_bf16_available, is_torch_tf32_available
 transformers.utils.logging.set_verbosity_error()
+from datasets import load_dataset
+from PIL import Image
+import io
 
 # PARAMETERS
 updates = 1500000
@@ -33,14 +36,14 @@ max_iters = updates * grad_accum_steps
 print_every = 1000 * grad_accum_steps
 extra_ckpt_every = 10000 * grad_accum_steps
 lr = 1e-5
-generate_new_wandb_id = False
+generate_new_wandb_id = True
 
-dataset_path = ""
+dataset_path = "https://cdn-lfs.huggingface.co/repos/e5/7b/e57b39be65da892393aa7769188e16bb28938205fc6ddceb6a8aeeb1c05a8425/4ff1154be04b81d156804624331f87d946000a8d32e9f458d5a3f5c555ffaa11?response-content-disposition=attachment%3B+filename*%3DUTF-8%27%27part-00000-5d6701c4-b238-4c0a-84e4-fe8e9daea963-c000.snappy.parquet%3B+filename%3D%22part-00000-5d6701c4-b238-4c0a-84e4-fe8e9daea963-c000.snappy.parquet%22%3B&Expires=1701536940&Policy=eyJTdGF0ZW1lbnQiOlt7IkNvbmRpdGlvbiI6eyJEYXRlTGVzc1RoYW4iOnsiQVdTOkVwb2NoVGltZSI6MTcwMTUzNjk0MH19LCJSZXNvdXJjZSI6Imh0dHBzOi8vY2RuLWxmcy5odWdnaW5nZmFjZS5jby9yZXBvcy9lNS83Yi9lNTdiMzliZTY1ZGE4OTIzOTNhYTc3NjkxODhlMTZiYjI4OTM4MjA1ZmM2ZGRjZWI2YThhZWViMWMwNWE4NDI1LzRmZjExNTRiZTA0YjgxZDE1NjgwNDYyNDMzMWY4N2Q5NDYwMDBhOGQzMmU5ZjQ1OGQ1YTNmNWM1NTVmZmFhMTE%7EcmVzcG9uc2UtY29udGVudC1kaXNwb3NpdGlvbj0qIn1dfQ__&Signature=IThVOQ7aKNMHarhHAy5XhEjK7EmyyMXbbouNe5jBM4eItEeB8GC1aPJJ%7EQoihyLqLlvhNIkV3hI1oCVxzXfgb2a2hf-Sk2B588XH1w3IG2TyizLbSjO%7EJqUwHKacrXOkKtHf1JUYsW0cghhFNr%7EJ0ByeTO33d%7EQsxZmCK3CJ60D%7El%7EBgx0EP663SKD48ctl6RT4ji4%7EZQ5viE0fyBtN5s6QJhzIS%7EaTqNTAKlzTGLrpLPS93jWNNtEBxlL3tmKWi6qgdIuHHOvMywWrdgb8QpmIn68hoyWcXjyBDPB69pv-xQGoV6RjuoHYIpmfs8%7ErL2bqUHm-yp5qAVCtO4QulsQ__&Key-Pair-Id=KVTP0A1DKRTAX"
 run_name = "Würstchen-Paella-v4-512-CLIP-text"
 output_path = f"output/würstchen/{run_name}"
 os.makedirs(output_path, exist_ok=True)
 checkpoint_dir = f"models/würstchen/"
-checkpoint_path = os.path.join(checkpoint_dir, run_name, "model_stage_b.pt")
+checkpoint_path = os.path.join(checkpoint_dir, run_name, "model_v2_stage_b.pt")
 os.makedirs(os.path.join(checkpoint_dir, run_name), exist_ok=True)
 
 wandv_project = ""
@@ -90,6 +93,14 @@ def ddp_setup(rank, world_size, n_node, node_id):  # <--- DDP
     )
     print(f"[GPU {rank + node_id * world_size}] READY")
 
+def custom_collate_fn(batch):
+    return batch
+
+def apply_transforms(example):
+    image = np.asarray(example['target'].convert('RGB')).copy()
+    # Apply the defined transform
+    transformed_image = transforms(image)
+    return {"image": transformed_image, "caption": example['image_caption']}
 
 def train(gpu_id, world_size, n_nodes):
     node_id = int(os.environ["SLURM_PROCID"])
@@ -103,28 +114,33 @@ def train(gpu_id, world_size, n_nodes):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+
+
+    dataset = load_dataset("mingyy/chinese_landscape_paintings", split='train')
+    transformed_dataset = dataset.map(apply_transforms)
     # --- PREPARE DATASET ---
-    dataset = wds.WebDataset(
-        dataset_path, resampled=True, handler=warn_and_continue
-    ).select(
-        WebdatasetFilter(min_size=512, max_pwatermark=0.5, aesthetic_threshold=5.0, unsafe_threshold=0.99)
-    ).shuffle(690, handler=warn_and_continue).decode(
-        "pilrgb", handler=warn_and_continue
-    ).to_tuple(
-        "jpg", "txt", handler=warn_and_continue
-    ).map_tuple(
-        transforms, identity, handler=warn_and_continue
-    )
+    #dataset = wds.WebDataset(
+    #    dataset_path, resampled=True, handler=warn_and_continue
+    #).select(
+    #    WebdatasetFilter(min_size=512, max_pwatermark=0.5, aesthetic_threshold=5.0, unsafe_threshold=0.99)
+    #).shuffle(690, handler=warn_and_continue).decode(
+    #    "pilrgb", handler=warn_and_continue
+    #).to_tuple(
+    #    "jpg", "txt", handler=warn_and_continue
+    #).map_tuple(
+    #    transforms, identity, handler=warn_and_continue
+    #)
 
     real_batch_size = batch_size // (world_size * n_nodes * grad_accum_steps)
 
-    dataloader = DataLoader(dataset, batch_size=real_batch_size, num_workers=8, pin_memory=True)
+    dataloader = DataLoader(transformed_dataset, batch_size=real_batch_size, num_workers=8, pin_memory=True)
 
     if main_node:
         print("REAL BATCH SIZE / DEVICE:", real_batch_size)
 
     # --- PREPARE MODELS ---
     try:
+        print(checkpoint_path)
         checkpoint = torch.load(checkpoint_path, map_location=device) if os.path.exists(checkpoint_path) else None
     except RuntimeError as e:
         if os.path.exists(f"{checkpoint_path}.bak"):
@@ -147,17 +163,20 @@ def train(gpu_id, world_size, n_nodes):
     # - Paella Model as generator - 
     generator = DiffNeXt().to(device)
     if checkpoint is not None:
+        print("generator loading")
+
         generator.load_state_dict(checkpoint['state_dict'])
+        print("generator loaded")
 
     # - EfficientNet -
-    effnet = EfficientNetEncoder(effnet="efficientnet_v2_l").to(device)
+    effnet = EfficientNetEncoder().to(device)
     if checkpoint is not None:
         if "effnet_state_dict" in checkpoint:
             effnet.load_state_dict(checkpoint['effnet_state_dict'])
 
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(Wrapper(effnet, generator, device=device).to(device))
 
-    model = DDP(model, device_ids=[gpu_id], output_device=device)  # <--- DDP
+    #model = DDP(model, device_ids=[gpu_id], output_device=device)  # <--- DDP
 
     # - SETUP WANDB - 
     if main_node:
@@ -166,7 +185,7 @@ def train(gpu_id, world_size, n_nodes):
             run_id = checkpoint['wandb_run_id']
         else:
             run_id = wandb.util.generate_id()
-        wandb.init(project=wandv_project, name=wandb_run_name, entity=wandv_entity, id=run_id, resume="allow")
+        #wandb.init(project=wandv_project, name=wandb_run_name, entity=wandv_entity, id=run_id, resume="allow")
 
     # SETUP OPTIMIZER, SCHEDULER & CRITERION
     optimizer = optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95))  # eps=1e-4
@@ -176,16 +195,16 @@ def train(gpu_id, world_size, n_nodes):
     if checkpoint is not None:
         try:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.last_epoch = checkpoint['scheduler_last_step']
         except:
             print("Failed loading optimizer, skipping...")
-        scheduler.last_epoch = checkpoint['scheduler_last_step']
     scaler = torch.cuda.amp.GradScaler()
     if checkpoint is not None and 'grad_scaler_state_dict' in checkpoint:
         scaler.load_state_dict(checkpoint['grad_scaler_state_dict'])
 
     start_iter = 1
     grad_norm = torch.tensor(0, device=device)
-    if checkpoint is not None:
+    if checkpoint is not None and 'scheduler_last_step' in checkpoint:
         start_iter = checkpoint['scheduler_last_step'] * grad_accum_steps + 1
         if main_node:  # <--- DDP
             print("RESUMING TRAINING FROM ITER ", start_iter)
@@ -198,20 +217,22 @@ def train(gpu_id, world_size, n_nodes):
         torch.cuda.empty_cache()
 
         # -------------- START TRAINING --------------
+    print("starting training")
     dataloader_iterator = iter(dataloader)
     pbar = tqdm(range(start_iter, max_iters + 1)) if (main_node) else range(start_iter, max_iters + 1)  # <--- DDP
     model.train()
     for it in pbar:
-        images, captions = next(dataloader_iterator)
-        original_images = images.to(device)
+        image, caption = next(dataloader_iterator)
+        original_images = image.to(device)
+        
 
         images, masks = add_random_white_box_and_get_mask_batch(original_images)
 
         with torch.cuda.amp.autocast(dtype=_float16_dtype), torch.no_grad():
             if np.random.rand() < 0.05:  # 90% of the time, drop the CLIP text embeddings (indepentently)
-                clip_captions = [''] * len(captions)  # 5% of the time drop all the captions
+                clip_captions = [''] * len(caption)  # 5% of the time drop all the captions
             else:
-                clip_captions = captions
+                clip_captions = caption
             clip_tokens = clip_tokenizer(clip_captions, truncation=True, padding="max_length",
                                          max_length=clip_tokenizer.model_max_length, return_tensors="pt").to(device)
             clip_text_embeddings = clip_model(**clip_tokens).last_hidden_state
@@ -226,7 +247,7 @@ def train(gpu_id, world_size, n_nodes):
         with torch.cuda.amp.autocast(dtype=_float16_dtype):
             pred = model(noised_latents, t, effnet_preproc, clip_text_embeddings)
             loss = criterion(pred, latents)
-            loss=loss*mask
+            loss=loss*masks
             loss = ((loss * loss_weight).sum(dim=[1, 2]) / loss_weight.sum(dim=[1, 2])).mean()
             loss_adjusted = loss / grad_accum_steps
 
@@ -256,13 +277,13 @@ def train(gpu_id, world_size, n_nodes):
                 'total_steps': scheduler.last_epoch,
                 'skipped': skipped,
             })
-            wandb.log({
-                'loss': loss_adjusted.item(),
-                'acc': acc.item(),
-                'grad_norm': grad_norm.item(),
-                'lr': optimizer.param_groups[0]['lr'],
-                'total_steps': scheduler.last_epoch,
-            })
+            #wandb.log({
+            #    'loss': loss_adjusted.item(),
+            #    'acc': acc.item(),
+            #    'grad_norm': grad_norm.item(),
+            #    'lr': optimizer.param_groups[0]['lr'],
+            #    'total_steps': scheduler.last_epoch,
+            #})
 
         if main_node and (it == 1 or it % print_every == 0 or it == max_iters):  # <--- DDP
             # if main_node:
@@ -342,10 +363,10 @@ def train(gpu_id, world_size, n_nodes):
                 torch.cat([i for i in sampled_images_noimg.cpu()], dim=-1),
             ], dim=-2), f'{output_path}/{it:06d}.jpg')
 
-            log_data = [[captions[i]] + [wandb.Image(sampled_images[i])] + [wandb.Image(sampled_images_noimg[i])] + [
-                wandb.Image(images[i])] for i in range(len(images))]
-            log_table = wandb.Table(data=log_data, columns=["Captions", "Sampled", "Sampled noimg", "Orig"])
-            wandb.log({"Log": log_table})
+            #log_data = [[captions[i]] + [wandb.Image(sampled_images[i])] + [wandb.Image(sampled_images_noimg[i])] + [
+            #    wandb.Image(images[i])] for i in range(len(images))]
+            #log_table = wandb.Table(data=log_data, columns=["Captions", "Sampled", "Sampled noimg", "Orig"])
+            #wandb.log({"Log": log_table})
 
     destroy_process_group()  # <--- DDP
 

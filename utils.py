@@ -41,7 +41,7 @@ class WebdatasetFilter():
 transforms = torchvision.transforms.Compose([
     torchvision.transforms.ToTensor(),
     torchvision.transforms.Resize(512),
-    torchvision.transforms.RandomCrop(512),
+    #torchvision.transforms.RandomCrop(512),
 ])
 
 effnet_preprocess = torchvision.transforms.Compose([
