@@ -3,6 +3,7 @@ import torch
 import torchvision
 import numpy as np
 from torch import nn
+from diffuzz import Diffuzz
 
 
 class LayerNorm2d(nn.LayerNorm):
